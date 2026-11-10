@@ -56,7 +56,7 @@ Common flags:
 
 Download and run the latest standalone setup wizard from GitHub Releases:
 
-1. Go to the [Releases](https://github.com/M1nquan/ptd/releases) page.
+1. Go to the [Releases](https://github.com/M1nquan/PytoDynamic/releases) page.
 2. Download `PTD-Studio-Setup-v1.0.exe`.
 3. Run the installer to install PTD Studio and register `ptd` into your system `PATH`.
 
