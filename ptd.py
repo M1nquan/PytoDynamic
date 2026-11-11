@@ -315,7 +315,7 @@ inline bool directory_has_python_lib(const std::wstring& dir) {
 
 bool configure_isolated_python() {
     PyConfig config;
-    PyConfig_InitIsolatedConfig(&config);
+    PyConfig_InitPythonConfig(&config);
 
     config.isolated = 0;
     config.use_environment = 1;
@@ -347,6 +347,35 @@ bool configure_isolated_python() {
         EngineRuntime::set_error(std::string("Py_InitializeFromConfig failed: ") + (status.err_msg ? status.err_msg : "unknown"));
         return false;
     }
+
+    PyRun_SimpleString(
+        "import sys, os\n"
+        "cur_dir = os.path.abspath(os.getcwd())\n"
+        "sys_exe_dir = os.path.dirname(os.path.abspath(sys.executable))\n"
+        "probe_roots = [cur_dir, sys_exe_dir, os.path.dirname(cur_dir), os.path.dirname(sys_exe_dir)]\n"
+        "seen = set()\n"
+        "for root in probe_roots:\n"
+        "    if not root or root in seen: continue\n"
+        "    seen.add(root)\n"
+        "    sub_candidates = [\n"
+        "        os.path.join(root, 'venv', 'Lib', 'site-packages'),\n"
+        "        os.path.join(root, '.venv', 'Lib', 'site-packages'),\n"
+        "        os.path.join(root, 'Lib', 'site-packages'),\n"
+        "        os.path.join(root, 'site-packages'),\n"
+        "        os.path.join(root, 'ka', 'venv', 'Lib', 'site-packages')\n"
+        "    ]\n"
+        "    for sp in sub_candidates:\n"
+        "        if os.path.isdir(sp) and sp not in sys.path:\n"
+        "            sys.path.insert(0, sp)\n"
+        "            for pkg in ['cv2', 'PyQt6', 'torch']:\n"
+        "                pkg_path = os.path.join(sp, pkg)\n"
+        "                if os.path.isdir(pkg_path) and hasattr(os, 'add_dll_directory'):\n"
+        "                    try:\n"
+        "                        os.add_dll_directory(pkg_path)\n"
+        "                    except Exception:\n"
+        "                        pass\n"
+    );
+
     return true;
 }
 
@@ -602,34 +631,8 @@ int perform_safe_shutdown(uint32_t timeout_ms, bool is_process_exit) {
     g_engine.gate.store(terminating_val, std::memory_order_release);
 
     if (Py_IsInitialized()) {
-        if (g_engine.we_own_python) {
-            if (GetCurrentThreadId() == g_engine.init_thread_id) {
-                if (g_engine.dll_saved_tstate) {
-                    PyEval_RestoreThread(g_engine.dll_saved_tstate);
-                    g_engine.dll_saved_tstate = nullptr;
-                }
-                Py_CLEAR(g_engine.target_module);
-                Py_FinalizeEx();
-            } else {
-                EngineRuntime::set_error("ptd_shutdown called on a different thread than initialization thread. Skipping Py_FinalizeEx to avoid crash.");
-                ThreadGILState gil;
-                Py_CLEAR(g_engine.target_module);
-            }
-        } else {
-            ThreadGILState gil;
-            PyObject* modules = PyImport_GetModuleDict();
-            if (modules && PyDict_Check(modules)) {
-                if (g_engine.target_module) {
-                    PyObject* registered = PyDict_GetItemString(modules, kModuleName);
-                    if (registered == g_engine.target_module) {
-                        if (PyDict_DelItemString(modules, kModuleName) < 0) {
-                            PyErr_Clear();
-                        }
-                    }
-                }
-            }
-            Py_CLEAR(g_engine.target_module);
-        }
+        ThreadGILState gil;
+        Py_CLEAR(g_engine.target_module);
     }
 
     uint64_t final_val = static_cast<uint64_t>(STATE_TERMINATED) << 32;
@@ -1218,52 +1221,6 @@ def find_vswhere_vcvars() -> Optional[str]:
     return None
 
 def build_msvc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path, debug: bool, env_path: Optional[str]) -> Tuple[bool, str]:
-    vcvars = find_vswhere_vcvars()
-    in_path = shutil.which("cl") is not None
-    if not in_path and not vcvars:
-        return False, "MSVC compiler (cl.exe or vcvarsall.bat) not found on host."
-
-    arch = "amd64" if sdk.is_64bit else "x86"
-    machine = "X64" if sdk.is_64bit else "X86"
-
-    cmd = [
-        "cl", "/nologo", "/std:c++17", "/EHsc", "/W4", "/permissive-",
-        "/LD", "/MD", "/GS", "/DYNAMICBASE", "/NXCOMPAT"
-    ]
-    if debug:
-        cmd += ["/Zi", "/Od", "/D_DEBUG"]
-    else:
-        cmd += ["/O2", "/DNDEBUG", "/GL", "/guard:cf"]
-
-    cmd += [
-        f"/I{sdk.inc}", str(cpp),
-        f"/Fe:{out_dll}", f"/Fo:{str(tmp) + os.sep}",
-        "/link", f"/LIBPATH:{sdk.libs}", str(sdk.lib_file.name), "user32.lib",
-        f"/MACHINE:{machine}"
-    ]
-    if debug:
-        cmd.append("/DEBUG")
-    else:
-        cmd += ["/LTCG", "/guard:cf"]
-
-    bat_lines = ["@echo off"]
-    if vcvars and not in_path:
-        bat_lines.append(f'call "{vcvars}" {arch}')
-        bat_lines.append("if errorlevel 1 exit /b 1")
-    bat_lines.append(subprocess.list2cmdline(cmd))
-    bat_lines.append("exit /b %errorlevel%")
-
-    bat = tmp / "build_msvc.bat"
-    bat.write_text("\r\n".join(bat_lines) + "\r\n", encoding="mbcs")
-
-    run_env = os.environ.copy()
-    if env_path:
-        run_env["PATH"] = env_path + os.pathsep + run_env.get("PATH", "")
-
-    res = subprocess.run(["cmd.exe", "/d", "/c", str(bat)], cwd=str(tmp), capture_output=True, text=True, errors="replace", env=run_env)
-    return (res.returncode == 0 and out_dll.is_file()), res.stdout + res.stderr
-
-def build_msvc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path, debug: bool, env_path: Optional[str]) -> Tuple[bool, str]:
     search_path = (env_path + os.pathsep + os.environ.get("PATH", "")) if env_path else os.environ.get("PATH", "")
     vcvars = find_vswhere_vcvars()
     in_path = shutil.which("cl", path=search_path) is not None
@@ -1310,7 +1267,6 @@ def build_msvc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path,
     res = subprocess.run(["cmd.exe", "/d", "/c", str(bat)], cwd=str(tmp), capture_output=True, text=True, errors="replace", env=run_env)
     return (res.returncode == 0 and out_dll.is_file()), res.stdout + res.stderr
 
-
 def build_gcc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path, debug: bool, env_path: Optional[str]) -> Tuple[bool, str]:
     run_env = os.environ.copy()
     
@@ -1356,7 +1312,8 @@ def build_gcc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path, 
         str(cpp),
         f"-L{sdk.libs}",
         "-static-libgcc", "-static-libstdc++",
-        f"-l{sdk.lib_file.stem}", "-luser32",
+        "-Wl,-Bstatic", "-lwinpthread",
+        "-Wl,-Bdynamic", f"-l{sdk.lib_file.stem}", "-luser32",
         "-Wl,--dynamicbase", "-Wl,--nxcompat",
         "-o", str(out_dll)
     ]
