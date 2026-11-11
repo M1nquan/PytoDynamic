@@ -317,9 +317,9 @@ bool configure_isolated_python() {
     PyConfig config;
     PyConfig_InitIsolatedConfig(&config);
 
-    config.isolated = 1;
-    config.use_environment = 0;
-    config.site_import = 0;
+    config.isolated = 0;
+    config.use_environment = 1;
+    config.site_import = 1;
 
     std::wstring dll_dir = get_current_dll_dir();
     std::wstring chosen_home;
@@ -1263,6 +1263,54 @@ def build_msvc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path,
     res = subprocess.run(["cmd.exe", "/d", "/c", str(bat)], cwd=str(tmp), capture_output=True, text=True, errors="replace", env=run_env)
     return (res.returncode == 0 and out_dll.is_file()), res.stdout + res.stderr
 
+def build_msvc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path, debug: bool, env_path: Optional[str]) -> Tuple[bool, str]:
+    search_path = (env_path + os.pathsep + os.environ.get("PATH", "")) if env_path else os.environ.get("PATH", "")
+    vcvars = find_vswhere_vcvars()
+    in_path = shutil.which("cl", path=search_path) is not None
+    if not in_path and not vcvars:
+        return False, "MSVC compiler (cl.exe or vcvarsall.bat) not found on host."
+
+    machine = "X64" if sdk.is_64bit else "X86"
+
+    cmd = [
+        "cl", "/nologo", "/std:c++17", "/EHsc", "/W4", "/permissive-",
+        "/LD", "/MD", "/GS", "/DYNAMICBASE", "/NXCOMPAT"
+    ]
+    if debug:
+        cmd += ["/Zi", "/Od", "/D_DEBUG"]
+    else:
+        cmd += ["/O2", "/DNDEBUG", "/GL", "/guard:cf"]
+
+    cmd += [
+        f"/I{sdk.inc}", str(cpp),
+        f"/Fe:{out_dll}", f"/Fo:{str(tmp) + os.sep}",
+        "/link", f"/LIBPATH:{sdk.libs}", str(sdk.lib_file.name), "user32.lib",
+        f"/MACHINE:{machine}"
+    ]
+    if debug:
+        cmd.append("/DEBUG")
+    else:
+        cmd += ["/LTCG", "/guard:cf"]
+
+    bat_lines = ["@echo off"]
+    if vcvars and not in_path:
+        arch = "amd64" if sdk.is_64bit else "x86"
+        bat_lines.append(f'call "{vcvars}" {arch}')
+        bat_lines.append("if errorlevel 1 exit /b 1")
+    bat_lines.append(subprocess.list2cmdline(cmd))
+    bat_lines.append("exit /b %errorlevel%")
+
+    bat = tmp / "build_msvc.bat"
+    bat.write_text("\r\n".join(bat_lines) + "\r\n", encoding="mbcs")
+
+    run_env = os.environ.copy()
+    if env_path:
+        run_env["PATH"] = env_path + os.pathsep + run_env.get("PATH", "")
+
+    res = subprocess.run(["cmd.exe", "/d", "/c", str(bat)], cwd=str(tmp), capture_output=True, text=True, errors="replace", env=run_env)
+    return (res.returncode == 0 and out_dll.is_file()), res.stdout + res.stderr
+
+
 def build_gcc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path, debug: bool, env_path: Optional[str]) -> Tuple[bool, str]:
     run_env = os.environ.copy()
     
@@ -1308,7 +1356,7 @@ def build_gcc_native(cpp: Path, out_dll: Path, sdk: PythonSDKLayout, tmp: Path, 
         str(cpp),
         f"-L{sdk.libs}",
         "-static-libgcc", "-static-libstdc++",
-        "-Wl,-Bdynamic", f"-l{sdk.lib_file.stem}", "-luser32",
+        f"-l{sdk.lib_file.stem}", "-luser32",
         "-Wl,--dynamicbase", "-Wl,--nxcompat",
         "-o", str(out_dll)
     ]
@@ -1453,7 +1501,7 @@ def compile_engine(
             shutil.copyfile(cpp_file, preserved)
             emit(f"[*] Bridge source preserved: {preserved}")
 
-        stage_dll = staging_dir / f"staged_{out_dll.name}"
+        stage_dll = staging_dir / out_dll.name
 
         runners = []
         if compiler in (Compiler.AUTO, Compiler.MSVC):
