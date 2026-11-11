@@ -314,6 +314,8 @@ inline bool directory_has_python_lib(const std::wstring& dir) {
 }
 
 bool configure_isolated_python() {
+    SetDllDirectoryW(NULL);
+
     PyConfig config;
     PyConfig_InitPythonConfig(&config);
 
@@ -367,8 +369,8 @@ bool configure_isolated_python() {
         "    for sp in sub_candidates:\n"
         "        if os.path.isdir(sp) and sp not in sys.path:\n"
         "            sys.path.insert(0, sp)\n"
-        "            for pkg in ['cv2', 'PyQt6', 'torch']:\n"
-        "                pkg_path = os.path.join(sp, pkg)\n"
+        "            for sub in os.listdir(sp):\n"
+        "                pkg_path = os.path.join(sp, sub)\n"
         "                if os.path.isdir(pkg_path) and hasattr(os, 'add_dll_directory'):\n"
         "                    try:\n"
         "                        os.add_dll_directory(pkg_path)\n"

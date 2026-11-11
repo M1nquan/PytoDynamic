@@ -1,8 +1,10 @@
 import os
 import shutil
 import sys
+import ast
+import importlib.util
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor, QDragEnterEvent, QDropEvent, QFont, QTextCharFormat
@@ -26,7 +28,6 @@ QWidget {
     font-size: 13px;
 }
 
-/* Header & Containers */
 QFrame#TopHeader {
     background-color: #161920;
     border-bottom: 1px solid #232731;
@@ -60,7 +61,6 @@ QLabel#FieldLabel {
     color: #7d8799;
 }
 
-/* Inputs */
 QLineEdit {
     background-color: #0d0f14;
     border: 1px solid #282e3b;
@@ -106,7 +106,6 @@ QComboBox QAbstractItemView {
     padding: 4px;
 }
 
-/* Buttons */
 QPushButton {
     background-color: #212631;
     border: 1px solid #2e3545;
@@ -149,7 +148,6 @@ QPushButton#PrimaryBuildBtn:disabled {
     color: #3b5a41;
 }
 
-/* Checkboxes */
 QCheckBox {
     color: #c9d1d9;
     font-size: 12px;
@@ -170,7 +168,6 @@ QCheckBox::indicator:checked {
     border-color: #388bfd;
 }
 
-/* Terminal & Console */
 QTextEdit#Terminal {
     background-color: #08090c;
     border: 1px solid #1c202a;
@@ -190,7 +187,6 @@ QProgressBar::chunk {
     background-color: #4f9cf9;
 }
 
-/* ScrollBar */
 QScrollBar:vertical {
     background-color: #08090c;
     width: 8px;
@@ -240,6 +236,170 @@ def detect_toolchain_bin() -> str:
         if (Path(c) / "g++.exe").is_file():
             return c
     return ""
+
+def locate_all_site_packages(reference_path: Optional[str] = None) -> List[Path]:
+    resolved_paths: List[Path] = []
+    seen = set()
+
+    def register(candidate: Path):
+        try:
+            can_res = candidate.resolve()
+            if can_res.is_dir() and str(can_res) not in seen:
+                seen.add(str(can_res))
+                resolved_paths.append(can_res)
+        except Exception:
+            pass
+
+    for env_var in ("VIRTUAL_ENV", "CONDA_PREFIX"):
+        val = os.environ.get(env_var)
+        if val:
+            base = Path(val)
+            register(base / "Lib" / "site-packages")
+            register(base / "lib" / "site-packages")
+
+    if sys.prefix != sys.base_prefix or hasattr(sys, "real_prefix"):
+        base = Path(sys.prefix)
+        register(base / "Lib" / "site-packages")
+        register(base / "lib" / "site-packages")
+
+    scan_origins: List[Path] = [Path.cwd()]
+    if reference_path and os.path.exists(reference_path):
+        ref = Path(reference_path).resolve()
+        scan_origins.append(ref.parent if ref.is_file() else ref)
+
+    search_names = ["venv", ".venv", "env", ".env"]
+
+    for origin in scan_origins:
+        curr = origin
+        for _ in range(5):
+            for name in search_names:
+                v_root = curr / name
+                register(v_root / "Lib" / "site-packages")
+                register(v_root / "lib" / "site-packages")
+            if (curr / "pyvenv.cfg").is_file():
+                register(curr / "Lib" / "site-packages")
+                register(curr / "lib" / "site-packages")
+            parent = curr.parent
+            if parent == curr:
+                break
+            curr = parent
+
+    for p in sys.path:
+        if p and "site-packages" in p.lower():
+            register(Path(p))
+
+    return resolved_paths
+
+def extract_imported_modules(py_file_path: str) -> Set[str]:
+    modules = set()
+    try:
+        with open(py_file_path, "r", encoding="utf-8", errors="ignore") as f:
+            node = ast.parse(f.read(), filename=py_file_path)
+        for subnode in ast.walk(node):
+            if isinstance(subnode, ast.Import):
+                for alias in subnode.names:
+                    modules.add(alias.name.split(".")[0])
+            elif isinstance(subnode, ast.ImportFrom):
+                if subnode.module:
+                    modules.add(subnode.module.split(".")[0])
+    except Exception:
+        pass
+    return modules
+
+def analyze_target_dependencies(py_file_path: str) -> List[str]:
+    lines = []
+    if not os.path.isfile(py_file_path):
+        return lines
+
+    lines.append(f"[*] AST ANALYZER: Parsing target imports for: {os.path.basename(py_file_path)}")
+    imported = extract_imported_modules(py_file_path)
+    if not imported:
+        lines.append("[!] No root imports detected or syntax tree could not be evaluated.")
+        return lines
+
+    lines.append(f"[+] Identified {len(imported)} imported modules: {', '.join(sorted(imported))}")
+
+    sp_paths = locate_all_site_packages(py_file_path)
+    if sp_paths:
+        lines.append(f"[*] Search matrix includes {len(sp_paths)} site-packages target(s):")
+        for sp in sp_paths:
+            lines.append(f"    --> {sp}")
+    else:
+        lines.append("[!] Warning: Zero site-packages directories discovered.")
+
+    std_modules = set(sys.builtin_module_names) | {
+        "sys", "os", "time", "math", "re", "json", "ast", "logging", "ctypes",
+        "pathlib", "threading", "asyncio", "hashlib", "subprocess", "struct",
+        "tempfile", "shutil", "typing", "collections", "datetime", "functools",
+        "itertools", "dataclasses", "enum", "uuid", "io", "copy", "socket"
+    }
+
+    for mod in sorted(imported):
+        if mod in std_modules:
+            lines.append(f"  [ STANDARD LIB ] -> {mod}")
+            continue
+
+        resolved = False
+        for sp in sp_paths:
+            pkg_dir = sp / mod
+            py_file = sp / f"{mod}.py"
+            pyd_file = sp / f"{mod}.pyd"
+
+            if pkg_dir.is_dir():
+                bins = [f.name for f in pkg_dir.glob("*.dll")] + [f.name for f in pkg_dir.glob("*.pyd")]
+                if bins:
+                    lines.append(f"  [ VENV NATIVE ]  -> {mod} ({len(bins)} binary dynamic components detected)")
+                else:
+                    lines.append(f"  [ VENV PURE ]    -> {mod} (Pure Python package)")
+                resolved = True
+                break
+            elif py_file.is_file() or pyd_file.is_file():
+                lines.append(f"  [ VENV MODULE ]  -> {mod} (Single file module)")
+                resolved = True
+                break
+
+        if not resolved:
+            spec = importlib.util.find_spec(mod)
+            if spec is not None:
+                lines.append(f"  [ HOST SYSTEM ]  -> {mod} ({spec.origin or 'virtual namespace'})")
+            else:
+                lines.append(f"  [ ❌ MISSING ]    -> {mod} (Not installed in local venv or system environment)")
+
+    lines.append("[*] ----------------------------------------------------------------")
+    return lines
+
+def scan_virtualenv_environment(reference_path: Optional[str] = None) -> List[str]:
+    lines = []
+    lines.append("[*] ENVIRONMENT AUDIT: Inspecting Python virtual environment runtime...")
+
+    in_venv = (sys.prefix != sys.base_prefix) or ("VIRTUAL_ENV" in os.environ)
+    if in_venv:
+        active_env = os.environ.get("VIRTUAL_ENV", sys.prefix)
+        lines.append(f"[+] Active process is running inside virtual environment: {active_env}")
+    else:
+        lines.append("[!] Process executed via standard base Python environment")
+
+    sp_paths = locate_all_site_packages(reference_path)
+    if sp_paths:
+        lines.append(f"[+] Verified {len(sp_paths)} site-packages directory locations:")
+        for sp in sp_paths:
+            lines.append(f"    --> {sp}")
+            for critical_pkg in ["cv2", "PyQt6", "torch"]:
+                c_dir = sp / critical_pkg
+                if c_dir.is_dir():
+                    bin_count = len(list(c_dir.glob("*.dll"))) + len(list(c_dir.glob("*.pyd")))
+                    lines.append(f"        [OK] {critical_pkg} located ({bin_count} binaries)")
+    else:
+        lines.append("[-] Could not locate valid site-packages in active or parent directories")
+
+    try:
+        import cv2
+        lines.append(f"[+] Dynamic module load verified: OpenCV (cv2) v{cv2.__version__}")
+    except Exception as e:
+        lines.append(f"[!] Dynamic module load check: cv2 import failed ({e})")
+
+    lines.append("[*] ----------------------------------------------------------------")
+    return lines
 
 class BuildWorker(QThread):
     log_signal = pyqtSignal(str)
@@ -297,7 +457,7 @@ class SelftestWorker(QThread):
 class PeInspectorDialog(QDialog):
     def __init__(self, dll_path: Path, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"PE/ABI Directory — {dll_path.name}")
+        self.setWindowTitle(f"PE / ABI Directory Explorer — {dll_path.name}")
         self.resize(680, 500)
         self.setStyleSheet(STUDIO_MODERN_STYLE)
         layout = QVBoxLayout(self)
@@ -321,7 +481,7 @@ class PeInspectorDialog(QDialog):
         m_layout.addWidget(QLabel("Artifact Size:"), 1, 0)
         m_layout.addWidget(QLabel(f"{sz_kb:.2f} KB ({dll_path.stat().st_size:,} bytes)"), 1, 1)
 
-        m_layout.addWidget(QLabel("Location:"), 2, 0)
+        m_layout.addWidget(QLabel("Target Path:"), 2, 0)
         lbl_p = QLabel(str(dll_path))
         lbl_p.setWordWrap(True)
         lbl_p.setStyleSheet("color: #7d8799; font-size: 11px;")
@@ -366,7 +526,7 @@ class PeInspectorDialog(QDialog):
 class TestMatrixDialog(QDialog):
     def __init__(self, records: List[Tuple[str, str]], summary: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Verification Suite Results")
+        self.setWindowTitle("Runtime Certification Test Matrix")
         self.resize(720, 520)
         self.setStyleSheet(STUDIO_MODERN_STYLE)
         layout = QVBoxLayout(self)
@@ -375,7 +535,7 @@ class TestMatrixDialog(QDialog):
 
         self.table = QTableWidget()
         self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["Status", "Verification Item"])
+        self.table.setHorizontalHeaderLabels(["Status", "Verification Check"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.setStyleSheet(
@@ -415,6 +575,12 @@ class PtdWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.last_dll: Optional[Path] = None
         self.init_ui()
+        self.run_startup_diagnostics()
+
+    def run_startup_diagnostics(self, reference_path: Optional[str] = None):
+        diag_lines = scan_virtualenv_environment(reference_path)
+        for line in diag_lines:
+            self.append_log(line)
 
     def init_ui(self):
         self.setStyleSheet(STUDIO_MODERN_STYLE)
@@ -654,6 +820,11 @@ class PtdWindow(QMainWindow):
             p = Path(src_path)
             if not self.txt_dest.text() or self.txt_dest.text().endswith(".dll"):
                 self.txt_dest.setText(str(p.with_suffix(".dll")))
+            if os.path.isfile(src_path):
+                self.run_startup_diagnostics(src_path)
+                dep_lines = analyze_target_dependencies(src_path)
+                for line in dep_lines:
+                    self.append_log(line)
 
     def append_log(self, text: str):
         cursor = self.console.textCursor()
@@ -671,7 +842,7 @@ class PtdWindow(QMainWindow):
                 fmt.setForeground(QColor("#4f9cf9"))
             elif line.startswith("[!]"):
                 fmt.setForeground(QColor("#d29922"))
-            elif line.startswith("[FAIL]"):
+            elif line.startswith("[FAIL]") or line.startswith("[-]"):
                 fmt.setForeground(QColor("#f85149"))
             elif line.startswith("[PASS]"):
                 fmt.setForeground(QColor("#2ea043"))
@@ -718,6 +889,11 @@ class PtdWindow(QMainWindow):
             return
 
         self.console.clear()
+        self.run_startup_diagnostics(src)
+        dep_lines = analyze_target_dependencies(src)
+        for line in dep_lines:
+            self.append_log(line)
+
         self.btn_build.setEnabled(False)
         self.btn_inspect.setEnabled(False)
         self.btn_test.setEnabled(False)
@@ -751,7 +927,7 @@ class PtdWindow(QMainWindow):
             self.last_dll = Path(res)
             self.btn_inspect.setEnabled(True)
             self.btn_test.setEnabled(True)
-            self.append_log(f"\n[+] Build successful: {res}")
+            self.append_log(f"\n[+] Build completed successfully: {res}")
             self.statusBar.showMessage("Compilation complete.")
             QMessageBox.information(self, "Success", f"Build succeeded:\n{res}")
         else:
